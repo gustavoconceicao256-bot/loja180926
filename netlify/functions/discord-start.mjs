@@ -7,8 +7,32 @@ function getDiscordConfig(req) {
     process.env.DISCORD_CLIENT_ID || DEFAULT_CLIENT_ID
   ).trim();
 
-  const redirectUri =
-  'https://sapucaia-rj-lojaa-ofical.netlify.app/api/discord-callback';
+  /*
+   * O redirect_uri precisa ser exatamente o mesmo em /api/discord-start
+   * e em /api/discord-callback, e precisa estar cadastrado no painel do
+   * Discord. Usamos o domínio da requisição (ou DISCORD_REDIRECT_URI /
+   * URL) para nunca apontar para um domínio antigo.
+   */
+  const explicit = String(
+    process.env.DISCORD_REDIRECT_URI || ''
+  ).trim();
+
+  let origin = '';
+
+  try {
+    origin = new URL(req.url).origin;
+  } catch {
+    origin = '';
+  }
+
+  if (!origin) {
+    origin = String(
+      process.env.URL || ''
+    ).trim().replace(/\/+$/, '');
+  }
+
+  const redirectUri = explicit ||
+    `${origin}/api/discord-callback`;
 
   return { clientId, redirectUri };
 }
