@@ -1,388 +1,206 @@
-import * as crypto from 'node:crypto';
+import {
+  getClientId,
+  getClientSecret,
+  getSessionSecret,
+  resolveOrigin,
+  resolveRedirectUri,
+  verifyState,
+  cookie,
+  createSessionToken,
+  STATE_COOKIE,
+  SESSION_COOKIE,
+  SESSION_MAX_AGE
+} from './_discord-oauth.mjs';
 
-const DEFAULT_CLIENT_ID = '1548916664895144046';
+function page(title, message, hint, origin, status) {
+  const html = `<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+</head>
+<body style="background:#06060a;color:#fff;font-family:Arial,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0">
+<div style="text-align:center;padding:24px;max-width:520px">
+<h2>${title}</h2>
+<p style="color:#a6a0aa;line-height:1.5">${message}</p>
+${hint ? `<p style="color:#ff4fa3;font-size:14px;line-height:1.5">${hint}</p>` : ''}
+<p><a href="${origin}/" style="color:#ff087f">Voltar para a loja</a></p>
+</div>
+</body>
+</html>`;
 
-function getDiscordConfig(req) {
-  const clientId = String(
-    process.env.DISCORD_CLIENT_ID || DEFAULT_CLIENT_ID
-  ).trim();
-
-  const redirectUri =
-  'https://sapucaia-rj-lojaa-ofical.netlify.app/api/discord-callback';
-
-  return { clientId, redirectUri };
-}
-
-function cookie(name, value, maxAge) {
-  return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${maxAge}`;
-}
-
-function safeEqual(a, b) {
-  const aa = Buffer.from(String(a || ''));
-  const bb = Buffer.from(String(b || ''));
-
-  return (
-    aa.length === bb.length &&
-    crypto.timingSafeEqual(aa, bb)
-  );
-}
-
-function verifySignedState(state, secret) {
-  try {
-    const parts = String(state || '').split('.');
-
-    if (parts.length !== 2) {
-      return false;
+  return new Response(html, {
+    status,
+    headers: {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store, no-cache, must-revalidate',
+      Pragma: 'no-cache'
     }
-
-    const [encodedPayload, signature] = parts;
-
-    if (!encodedPayload || !signature) {
-      return false;
-    }
-
-    const payload = Buffer
-      .from(encodedPayload, 'base64url')
-      .toString('utf8');
-
-    const expectedSignature = crypto
-      .createHmac('sha256', secret)
-      .update(payload)
-      .digest('base64url');
-
-    if (
-      !safeEqual(
-        signature,
-        expectedSignature
-      )
-    ) {
-      return false;
-    }
-
-    const separator = payload.indexOf('.');
-
-    if (separator === -1) {
-      return false;
-    }
-
-    const issuedAt = Number(
-      payload.slice(0, separator)
-    );
-
-    if (!Number.isFinite(issuedAt)) {
-      return false;
-    }
-
-    const age = Date.now() - issuedAt;
-
-    // Estado válido durante 10 minutos.
-    if (age > 10 * 60 * 1000) {
-      return false;
-    }
-
-    // Não aceita estado muito adiantado.
-    if (age < -60 * 1000) {
-      return false;
-    }
-
-    return true;
-  } catch {
-    return false;
-  }
+  });
 }
 
 export default async (req) => {
+  const origin = resolveOrigin(req);
+
   try {
     if (req.method !== 'GET') {
-      return new Response(
-        'Método não permitido.',
-        { status: 405 }
-      );
+      return new Response('Método não permitido.', { status: 405 });
     }
 
     const url = new URL(req.url);
+    const code = String(url.searchParams.get('code') || '').trim();
+    const state = String(url.searchParams.get('state') || '').trim();
+    const oauthError = String(url.searchParams.get('error') || '').trim();
 
-    const code = String(
-      url.searchParams.get('code') || ''
-    ).trim();
+    // O Discord avisa aqui quando a pessoa cancelou a autorização.
+    if (oauthError) {
+      const description = String(url.searchParams.get('error_description') || '').trim();
 
-    const state = String(
-      url.searchParams.get('state') || ''
-    ).trim();
+      return page(
+        'Autorização cancelada',
+        description || 'A autorização do Discord não foi concluída.',
+        '',
+        origin,
+        400
+      );
+    }
 
-    const { clientId, redirectUri } = getDiscordConfig(req);
-
-    const clientSecret = String(
-      process.env.DISCORD_CLIENT_SECRET || ''
-    ).trim();
-
-    const sessionSecret = String(
-      process.env.DISCORD_SESSION_SECRET || ''
-    ).trim();
+    const clientId = getClientId();
+    const clientSecret = getClientSecret();
+    const sessionSecret = getSessionSecret();
 
     if (!clientSecret || !sessionSecret) {
-      console.error(
-        'Discord OAuth incompleto: falta DISCORD_CLIENT_SECRET ou DISCORD_SESSION_SECRET.'
-      );
-
-      return new Response(
-        'Discord OAuth não configurado corretamente no servidor.',
-        { status: 503 }
+      console.error('Discord OAuth incompleto: falta DISCORD_CLIENT_SECRET ou DISCORD_SESSION_SECRET.');
+      return page(
+        'Discord não configurado',
+        'A loja ainda não tem as credenciais do Discord configuradas no servidor.',
+        '',
+        origin,
+        503
       );
     }
 
     if (!code || !state) {
-      return new Response(
-        'Autorização do Discord inválida ou expirada.',
-        {
-          status: 400,
-          headers: {
-            'content-type':
-              'text/plain; charset=utf-8'
-          }
-        }
+      return page('Autorização inválida', 'A autorização do Discord está inválida ou expirada.', '', origin, 400);
+    }
+
+    const verified = verifyState(state, sessionSecret);
+
+    if (!verified) {
+      return page(
+        'Autorização inválida',
+        'A autorização do Discord está inválida ou expirada. Tente entrar novamente.',
+        '',
+        origin,
+        400
       );
     }
 
     /*
-     * O state agora é validado pela assinatura criptográfica.
-     * Não dependemos do cookie para validar a autorização.
+     * O redirect_uri da troca do código precisa ser idêntico ao enviado no
+     * início do fluxo, por isso ele vem assinado dentro do state.
      */
-    if (
-      !verifySignedState(
-        state,
-        sessionSecret
-      )
-    ) {
-      return new Response(
-        'Autorização do Discord inválida ou expirada.',
-        {
-          status: 400,
-          headers: {
-            'content-type':
-              'text/plain; charset=utf-8'
-          }
-        }
+    const redirectUri = verified.redirectUri || resolveRedirectUri(req);
+    const storeOrigin = verified.origin || origin;
+
+    const tokenRes = await fetch('https://discord.com/api/v10/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: clientId,
+        client_secret: clientSecret,
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri
+      }).toString()
+    });
+
+    const tokenBody = await tokenRes.json().catch(() => ({}));
+
+    if (!tokenRes.ok || !tokenBody.access_token) {
+      const reason = String(tokenBody?.error || '').trim();
+      const description = String(tokenBody?.error_description || '').trim();
+
+      console.error('Discord token exchange failed:', reason, description);
+
+      let hint = '';
+
+      if (reason === 'invalid_grant' || /redirect/i.test(description)) {
+        hint = `Cadastre exatamente esta URL em Discord Developer Portal &rarr; OAuth2 &rarr; Redirects: <code>${redirectUri}</code>`;
+      } else if (reason === 'invalid_client') {
+        hint = 'O DISCORD_CLIENT_ID e o DISCORD_CLIENT_SECRET não pertencem à mesma aplicação do Discord.';
+      }
+
+      return page(
+        'Não foi possível concluir a autorização do Discord',
+        description || reason || 'O Discord recusou a troca do código de autorização.',
+        hint,
+        storeOrigin,
+        502
       );
     }
 
-    const tokenRes = await fetch(
-      'https://discord.com/api/v10/oauth2/token',
-      {
-        method: 'POST',
+    const userRes = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: `Bearer ${tokenBody.access_token}` }
+    });
 
-        headers: {
-          'Content-Type':
-            'application/x-www-form-urlencoded'
-        },
-
-        body: new URLSearchParams({
-          client_id: clientId,
-          client_secret: clientSecret,
-          grant_type: 'authorization_code',
-          code,
-          redirect_uri: redirectUri
-        }).toString()
-      }
-    );
-
-    const tokenBody = await tokenRes
-      .json()
-      .catch(() => ({}));
-
-    if (
-      !tokenRes.ok ||
-      !tokenBody.access_token
-    ) {
-      console.error(
-        'Discord token exchange failed:',
-        tokenBody
-      );
-
-      return new Response(
-        'Não foi possível concluir a autorização do Discord.',
-        { status: 502 }
-      );
-    }
-
-    const userRes = await fetch(
-      'https://discord.com/api/v10/users/@me',
-      {
-        headers: {
-          Authorization:
-            `Bearer ${tokenBody.access_token}`
-        }
-      }
-    );
-
-    const user = await userRes
-      .json()
-      .catch(() => ({}));
+    const user = await userRes.json().catch(() => ({}));
 
     if (!userRes.ok || !user.id) {
-      console.error(
-        'Discord user lookup failed:',
-        user
-      );
-
-      return new Response(
-        'Não foi possível obter o usuário do Discord.',
-        { status: 502 }
+      console.error('Discord user lookup failed:', user?.message || userRes.status);
+      return page(
+        'Não foi possível obter o usuário do Discord',
+        'A autorização funcionou, mas os dados da conta não puderam ser lidos.',
+        '',
+        storeOrigin,
+        502
       );
     }
 
     const now = Date.now();
 
-    /*
-     * Dados da conta Discord.
-     *
-     * O ID é o identificador principal da conta.
-     * O avatar é guardado para a loja mostrar a foto.
-     */
     const sessionData = {
       id: String(user.id),
-
-      username: String(
-        user.username || ''
-      ),
-
-      global_name: String(
-        user.global_name ||
-          user.username ||
-          ''
-      ),
-
-      email:
-        user.email || null,
-
-      avatar:
-        user.avatar || null,
-
+      username: String(user.username || ''),
+      global_name: String(user.global_name || user.username || ''),
+      email: user.email || null,
+      avatar: user.avatar || null,
       iat: now,
-
-      /*
-       * A conta fica reconhecida por 30 dias
-       * enquanto o cookie de sessão existir e for válido.
-       */
-      exp:
-        now + 30 * 24 * 60 * 60 * 1000
+      exp: now + SESSION_MAX_AGE * 1000
     };
 
-    const payload = Buffer
-      .from(
-        JSON.stringify(sessionData),
-        'utf8'
-      )
-      .toString('base64url');
-
-    const signature = crypto
-      .createHmac(
-        'sha256',
-        sessionSecret
-      )
-      .update(payload)
-      .digest('base64url');
-
-    const sessionToken =
-      `${payload}.${signature}`;
+    const sessionToken = createSessionToken(sessionData, sessionSecret);
 
     const headers = new Headers({
-      'content-type':
-        'text/html; charset=utf-8',
-
-      'cache-control':
-        'no-store, no-cache, must-revalidate',
-
-      Pragma:
-        'no-cache'
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store, no-cache, must-revalidate',
+      Pragma: 'no-cache'
     });
 
-    /*
-     * Sessão da conta Discord por 30 dias.
-     */
-    headers.append(
-      'Set-Cookie',
-      cookie(
-        'sapucaia_discord_session',
-        sessionToken,
-        30 * 24 * 60 * 60
-      )
-    );
+    headers.append('Set-Cookie', cookie(SESSION_COOKIE, sessionToken, SESSION_MAX_AGE, origin));
+    headers.append('Set-Cookie', cookie(STATE_COOKIE, '', 0, origin));
 
-    /*
-     * Limpa o state usado no OAuth.
-     */
-    headers.append(
-      'Set-Cookie',
-      cookie(
-        'sapucaia_oauth_state',
-        '',
-        0
-      )
-    );
-
-    const html = `
-<!doctype html>
+    const html = `<!doctype html>
 <html lang="pt-BR">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport"
-        content="width=device-width,initial-scale=1">
-
-  <meta http-equiv="Cache-Control"
-        content="no-store">
-
-  <title>Discord conectado</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>Discord conectado</title>
 </head>
-
-<body style="
-  background:#06060a;
-  color:#fff;
-  font-family:Arial,sans-serif;
-  display:grid;
-  place-items:center;
-  min-height:100vh;
-  margin:0;
-">
-
-  <div style="
-    text-align:center;
-    padding:24px;
-  ">
-    <h2>Discord conectado ✅</h2>
-    <p>Redirecionando para a loja...</p>
-  </div>
-
-  <script>
-    window.location.replace(
-      '/?discord=connected'
-    );
-  </script>
-
+<body style="background:#06060a;color:#fff;font-family:Arial,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0">
+<div style="text-align:center;padding:24px">
+<h2>Discord conectado ✅</h2>
+<p>Redirecionando para a loja...</p>
+</div>
+<script>window.location.replace('/?discord=connected');</script>
 </body>
-</html>
-`;
+</html>`;
 
-    return new Response(
-      html,
-      {
-        status: 200,
-        headers
-      }
-    );
-
+    return new Response(html, { status: 200, headers });
   } catch (error) {
-
-    console.error(
-      'discord-callback error:',
-      error?.stack ||
-        error?.message ||
-        error
-    );
-
-    return new Response(
-      'Erro ao conectar o Discord.',
-      { status: 500 }
-    );
+    console.error('discord-callback error:', error?.stack || error?.message || error);
+    return page('Erro ao conectar o Discord', 'Tente novamente em alguns instantes.', '', origin, 500);
   }
 };
